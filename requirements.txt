@@ -1,0 +1,37 @@
+# ─── Core (required) ────────────────────────────────────────────────
+google-genai>=1.0.0
+mss>=9.0.0
+Pillow>=10.0.0
+pygame>=2.5.0
+numpy>=1.26.0
+psutil>=5.9.0
+httpx>=0.26.0
+python-dotenv>=1.0.0
+
+# ─── Platform-specific (required on respective OS) ──────────────────
+pywin32>=306;sys_platform=="win32"
+# pyobjc-framework-AppKit>=10.0;sys_platform=="darwin"  # macOS
+# ewmh>=0.1.6;sys_platform=="linux"                     # Linux
+
+# ─── Phase 2 — Wired Features ──────────────────────────────────────
+keyboard>=0.13.5       # Global hotkey (Ctrl+Shift+B break toggle)
+
+# ─── Phase 3 — Cloud Brain ─────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn>=0.27.0
+websockets>=12.0
+redis>=5.0.0           # Session persistence (optional, in-memory fallback)
+python-multipart>=0.0.7
+
+# ─── Phase 4 — Integrations (optional, uncomment as needed) ────────
+# google-auth-oauthlib>=1.2.0   # Google Calendar OAuth
+# google-api-python-client>=2.0 # Google Calendar / Gmail API
+# spotipy>=2.23.0               # Spotify music intelligence
+# supabase>=2.0.0               # Persistent storage (gamification, Smriti)
+
+# ─── Phase 5 — Wake Word & Audio (optional) ────────────────────────
+# pvporcupine>=3.0.0    # Wake word detection (Picovoice, needs access key)
+# pyaudio>=0.2.14       # Microphone capture for wake word
+
+# ─── Overlay UI (required — glass widget) ──────────────────────────
+PyQt6>=6.6.0            # Glass overlay (replaces tkinter)

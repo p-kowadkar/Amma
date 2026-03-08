@@ -1,0 +1,28 @@
+# Normalize line endings automatically
+* text=auto
+
+# Python — always LF
+*.py text eol=lf
+
+# Shell scripts — always LF
+*.sh text eol=lf
+
+# Windows batch — always CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# JSON/YAML/TOML — LF
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+
+# Markdown — LF
+*.md text eol=lf
+
+# Binaries — no line ending conversion
+*.png binary
+*.jpg binary
+*.ppn binary
+*.zip binary
+*.wav binary

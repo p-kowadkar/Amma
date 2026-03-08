@@ -1,0 +1,43 @@
+# ── Secrets ────────────────────────────────────────────────
+.env
+
+# ── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# ── Amma generated output ───────────────────────────────────
+receipts/
+reports/
+
+# ── Plans (Warp plan docs) ──────────────────────────────────
+Plan/
+
+# ── Wake word binaries ──────────────────────────────────────
+*.ppn
+*.zip
+Hi-Amma/
+
+# ── Markdown (all except README + SETUP) ───────────────────
+*.md
+!README.md
+!SETUP.md
+!Architecture.md
+
+# ── OS noise ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
