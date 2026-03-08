@@ -252,4 +252,14 @@ phone/
 
 > *"I am not punishing you. I am raising you."*
 
+---
+
+## Team
+
+| Name | Role |
+|---|---|
+| **Pranav Shridhar Kowadkar** | Solo Builder |
+
+---
+
 For setup, see [SETUP.md](SETUP.md).
