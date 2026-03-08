@@ -152,6 +152,10 @@ class AmmaSession:
         print(f"  Mode: {'DEMO' if self.config.demo_mode else 'LIVE'}")
         print(f"  Archetype: {self.config.archetype}")
         print(f"  Timezone: {self.config.timezone}")
+        if self.config.goals:
+            print(f"  Goals: {', '.join(self.config.goals)}")
+        if self.config.session_hours:
+            print(f"  Session target: {self.config.session_hours}h")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
         # Init components — share the single genai client
@@ -774,7 +778,13 @@ class AmmaSession:
         Returns the response text (1-3 sentences).
         """
         acc = self.state_machine.accumulator
+        goals_ctx = ""
+        if self.config.goals:
+            goals_ctx = f"Today's declared goals: {', '.join(self.config.goals)}. "
+            if self.config.session_hours:
+                goals_ctx += f"Session target: {self.config.session_hours}h. "
         ctx = (
+            goals_ctx +
             f"Work so far: {acc.work_minutes}m. Timepass: {acc.timepass_minutes}m. "
             f"Warning level: {acc.warning_level}/6. "
             f"Mode: {self.support_manager.mode.value}. "
@@ -973,6 +983,88 @@ class AmmaSession:
 # ── Config persistence ──────────────────────────────────────────────────
 AMMA_CONFIG_DIR = Path.home() / ".amma"
 AMMA_CONFIG_FILE = AMMA_CONFIG_DIR / "config.json"
+AMMA_SESSION_FILE = AMMA_CONFIG_DIR / "session_state.json"
+
+
+def load_session_state() -> Optional[dict]:
+    if AMMA_SESSION_FILE.exists():
+        with open(AMMA_SESSION_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def save_session_state(data: dict):
+    AMMA_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(AMMA_SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def ask_daily_goals(config: AmmaConfig) -> dict:
+    """Ask for today's goals if it's a new day, or confirm existing ones."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(config.timezone)
+        now_local = datetime.now(tz)
+    except Exception:
+        now_local = datetime.now()
+
+    today_str = now_local.date().isoformat()
+    hour = now_local.hour
+
+    state = load_session_state()
+    if state and state.get("date") == today_str and state.get("goals"):
+        # Same day, goals exist — confirm or update
+        goals = state["goals"]
+        hrs = state.get("session_hours")
+        hrs_str = f" ({hrs}h target)" if hrs else ""
+        print(f"\n  Welcome back. Today's goals{hrs_str}: {', '.join(goals)}")
+        try:
+            confirm = input("  Still the same? (Enter to keep / type new goals): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            confirm = ""
+        if not confirm:
+            print()
+            return state
+        new_goals = [g.strip() for g in confirm.split(",") if g.strip()]
+        state["goals"] = new_goals
+        state["goal_asked_at"] = now_local.strftime("%H:%M")
+        save_session_state(state)
+        print()
+        return state
+
+    # New day or no goals — ask fresh
+    print("\n" + "━" * 50)
+    if hour < 10:
+        print(f"  Good morning, {config.nickname}. New day. What are we doing today?")
+    elif hour >= 20:
+        print(f"  Late session, {config.nickname}. What exactly are you trying to finish?")
+    else:
+        print(f"  {config.nickname.capitalize()}, what are you working on today?")
+    print("━" * 50)
+
+    try:
+        goals_raw = input("  Goals (comma-separated, or Enter to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        goals_raw = ""
+    goals = [g.strip() for g in goals_raw.split(",") if g.strip()] if goals_raw else []
+
+    session_hours = None
+    try:
+        hrs_raw = input("  How many hours do you have? (Enter to skip): ").strip()
+        if hrs_raw:
+            session_hours = float(hrs_raw)
+    except (EOFError, KeyboardInterrupt, ValueError):
+        pass
+    print()
+
+    new_state = {
+        "date": today_str,
+        "goals": goals,
+        "session_hours": session_hours,
+        "goal_asked_at": now_local.strftime("%H:%M"),
+    }
+    save_session_state(new_state)
+    return new_state
 
 
 def save_user_config(data: dict):
@@ -1158,6 +1250,11 @@ async def main():
         # Returning user — restore saved profile
         apply_saved_config(config, saved)
         print(f"[Setup] Welcome back, {config.user_formal_name}. Profile loaded.")
+
+    # Daily goals — ask fresh each new day, confirm on re-launch
+    session_state = ask_daily_goals(config)
+    config.goals = session_state.get("goals", [])
+    config.session_hours = session_state.get("session_hours")
 
     # Pre-flight checks
     warnings = startup_checks(config)

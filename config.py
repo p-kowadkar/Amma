@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 @dataclass
 class AmmaConfig:
@@ -39,3 +39,6 @@ class AmmaConfig:
     custom_keyword_paths: List[str] = field(default_factory=list)
     # Customization
     custom_phrases: Dict[str, str] = field(default_factory=dict)
+    # Daily session goals (set each launch, not persisted in config)
+    goals: List[str] = field(default_factory=list)
+    session_hours: Optional[float] = None
