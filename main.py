@@ -8,6 +8,7 @@ import os
 import platform
 import random
 import sys
+import threading
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
@@ -97,7 +98,8 @@ def startup_checks(config: AmmaConfig) -> list[str]:
 
 # ── Main Amma Session ─────────────────────────────────────────────────────
 class AmmaSession:
-    def __init__(self, config: AmmaConfig, client: genai.Client):
+    def __init__(self, config: AmmaConfig, client: genai.Client,
+                 overlay: Optional[AmmaOverlay] = None):
         self.config = config
         self.client = client
         self.state_machine = AmmaStateMachine(debounce_seconds=config.debounce_seconds)
@@ -105,7 +107,7 @@ class AmmaSession:
         self.ruling_cache = SessionRulingCache()
         self.vision_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
         self.voice: Optional[AmmaVoice] = None
-        self.overlay: Optional[AmmaOverlay] = None
+        self.overlay: Optional[AmmaOverlay] = overlay  # Pre-created in main thread
         self.classifier: Optional[GeminiClassifier] = None
         self.last_classification: str = "WORK"
         self.frame_count = 0
@@ -167,8 +169,10 @@ class AmmaSession:
         )
         await self.voice.init_session()
 
-        self.overlay = AmmaOverlay()
-        self.overlay.start()
+        if self.overlay is None:
+            # Fallback: create overlay here (won't be in main thread — use only for testing)
+            self.overlay = AmmaOverlay()
+            self.overlay.start()
 
         self.running = True
 
@@ -1230,7 +1234,7 @@ def apply_saved_config(config: AmmaConfig, saved: dict):
         config.custom_keyword_paths = [saved["keyword_path"]]
 
 
-async def main():
+async def main(overlay: Optional[AmmaOverlay] = None):
     load_dotenv()
 
     config = AmmaConfig(
@@ -1272,9 +1276,31 @@ async def main():
     # Single shared client for all Gemini API calls
     client = genai.Client(api_key=config.gemini_api_key)
 
-    session = AmmaSession(config, client)
+    session = AmmaSession(config, client, overlay=overlay)
     await session.start()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # QApplication MUST live in the main OS thread — create it here first.
+    _overlay = AmmaOverlay()
+    _overlay.start()
+
+    # Run the asyncio session in a background thread.
+    _loop = asyncio.new_event_loop()
+
+    def _run_async():
+        asyncio.set_event_loop(_loop)
+        try:
+            _loop.run_until_complete(main(_overlay))
+        except Exception as _e:
+            print(f"[Main] Fatal: {_e}")
+        finally:
+            _overlay.stop()  # Signals Qt event loop to exit
+
+    _t = threading.Thread(target=_run_async, name="AmmaAsync")
+    _t.daemon = True
+    _t.start()
+
+    # Qt event loop blocks here in the main thread until _overlay.stop() is called.
+    _overlay.run_event_loop()
+    sys.exit(0)

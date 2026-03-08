@@ -287,34 +287,32 @@ class GlassWidget(QWidget):
 
 # ── AmmaOverlay — the public API called by main.py ────────────────────────────────
 class AmmaOverlay:
-    """Thread-safe wrapper. main.py calls overlay.update() from asyncio;
-    the Qt event loop runs in its own daemon thread."""
+    """Thread-safe wrapper. main.py calls overlay.update() from the asyncio
+    background thread; Qt event loop runs in the main OS thread."""
 
     def __init__(self):
         self._queue: queue.Queue = queue.Queue(maxsize=50)
         self._widget: Optional[GlassWidget] = None
-        self._thread: Optional[threading.Thread] = None
         self._app:    Optional[QApplication] = None
+        self._timer:  Optional[QTimer] = None
 
     def start(self):
-        """Start Qt app in daemon thread."""
-        self._thread = threading.Thread(target=self._run_qt, daemon=True, name="AmmaOverlay")
-        self._thread.start()
-
-    def _run_qt(self):
-        """Qt event loop (runs in daemon thread)."""
-        self._app = QApplication.instance() or QApplication([])
+        """Init Qt widget — MUST be called from the main OS thread."""
+        import sys
+        self._app = QApplication.instance() or QApplication(sys.argv)
         self._widget = GlassWidget()
         self._widget.show()
-        self._widget.raise_()          # Bring to front
-        self._widget.activateWindow()  # Ensure focus/visibility
+        self._widget.raise_()
+        self._widget.activateWindow()
+        # Poll the update queue every 100ms from the main thread
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._drain_queue)
+        self._timer.start(100)
 
-        # Poll the queue every 100ms and apply state
-        timer = QTimer()
-        timer.timeout.connect(self._drain_queue)
-        timer.start(100)
-
-        self._app.exec()
+    def run_event_loop(self):
+        """Block the main thread running the Qt event loop. Returns on quit()."""
+        if self._app:
+            self._app.exec()
 
     def _drain_queue(self):
         while not self._queue.empty():
@@ -351,6 +349,8 @@ class AmmaOverlay:
                 pass  # Drop if queue full (non-critical UI)
 
     def stop(self):
-        """Shut down the Qt overlay."""
+        """Shut down the Qt overlay (safe to call from any thread)."""
+        if self._timer:
+            self._timer.stop()
         if self._app:
             self._app.quit()
