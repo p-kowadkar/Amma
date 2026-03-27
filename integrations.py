@@ -5,6 +5,7 @@ smart home, health/wearable, contact awareness, and the Life Context Engine.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, date, timezone, timedelta
+from pathlib import Path
 from typing import Optional, List
 import random
 
@@ -46,15 +47,93 @@ class CalendarEvent:
 
 
 class CalendarIntegration:
-    """Stub for Google Calendar / Outlook / Apple Calendar."""
+    """Google Calendar integration with OAuth2. Requires:
+    - google-auth-oauthlib and google-api-python-client installed
+    - ~/.amma/credentials.json from Google Cloud Console
+    Gracefully skips if credentials or packages are missing.
+    """
+
+    SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+    TOKEN_PATH  = Path.home() / ".amma" / "calendar_token.json"
+    CREDS_PATH  = Path.home() / ".amma" / "credentials.json"
 
     def __init__(self, provider: str = "google"):
         self.provider = provider
         self.events: List[CalendarEvent] = []
+        self.is_available: bool = False
 
     async def sync_today(self) -> List[CalendarEvent]:
-        """Fetch today's events from the configured calendar provider."""
-        # TODO: implement OAuth + actual API calls
+        """Fetch today's events from Google Calendar via OAuth2."""
+        try:
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            from googleapiclient.discovery import build
+            from google.auth.transport.requests import Request as GRequest
+        except ImportError:
+            return self.events  # google-auth packages not installed
+
+        if not self.CREDS_PATH.exists():
+            return self.events  # No credentials.json configured
+
+        creds = None
+        if self.TOKEN_PATH.exists():
+            creds = Credentials.from_authorized_user_file(
+                str(self.TOKEN_PATH), self.SCOPES
+            )
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(GRequest())
+            else:
+                print("[Calendar] Opening browser for Google Calendar authorization...")
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(self.CREDS_PATH), self.SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+            self.TOKEN_PATH.write_text(creds.to_json())
+
+        try:
+            service = build("calendar", "v3", credentials=creds)
+            now = datetime.now(timezone.utc)
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+
+            result = service.events().list(
+                calendarId="primary",
+                timeMin=today_start.isoformat(),
+                timeMax=today_end.isoformat(),
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=20,
+            ).execute()
+
+            self.events = []
+            for item in result.get("items", []):
+                title = item.get("summary", "Untitled")
+                start_raw = item.get("start", {})
+                end_raw   = item.get("end", {})
+
+                def _parse(raw: dict) -> datetime:
+                    if "dateTime" in raw:
+                        return datetime.fromisoformat(
+                            raw["dateTime"].replace("Z", "+00:00")
+                        )
+                    d = date.fromisoformat(raw.get("date", now.date().isoformat()))
+                    return datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+
+                event = CalendarEvent(
+                    title=title,
+                    start=_parse(start_raw),
+                    end=_parse(end_raw),
+                    attendees=len(item.get("attendees", [])),
+                    location=item.get("location"),
+                )
+                event.event_type = event.classify()
+                self.events.append(event)
+
+            self.is_available = True
+            print(f"[Calendar] Synced {len(self.events)} events for today")
+        except Exception as e:
+            print(f"[Calendar] Sync failed: {e}")
         return self.events
 
     def get_upcoming(self, minutes: int = 30) -> List[CalendarEvent]:
@@ -101,7 +180,7 @@ def calculate_deadline_urgency(deadline: datetime,
             "level": "HIGH",
             "hours_remaining": round(hours, 1),
             "strictness_multiplier": 1.3,
-            "dialogue": f"Deadline in {int(hours)} hours. No timepass today.",
+            "dialogue": f"Deadline in {int(hours)} hours. No wasting time today.",
         }
     if hours <= 24:
         return {

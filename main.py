@@ -20,7 +20,7 @@ from google.genai import types
 
 from config import AmmaConfig
 from dialogue import get_line, get_volume
-from vision import vision_loop, ScreenFrame
+from vision import vision_loop, ScreenFrame, set_privacy_rules
 from classifier import GeminiClassifier, ClassificationResult
 from voice import AmmaVoice
 from overlay import AmmaOverlay
@@ -43,6 +43,19 @@ from content_reactions import ContentReactionState, get_content_reaction
 from special_days import get_todays_specials, get_special_greeting, get_strictness_modifier, should_reduce_monitoring
 from receipt_card import SessionStats, save_receipt_card
 from smriti import SmritiStore, MemoryRecord, ExcuseArchive, build_memory_context_block, compute_significance
+# Phase 1 — Reliability
+from deployment import AmmaLogger, AmmaLogEvent, fallback_classify_window_title, fallback_classify_process
+# Phase 2 — Calendar
+from integrations import (
+    CalendarIntegration, CalendarEvent, calculate_deadline_urgency,
+    NotificationQueue, Notification,
+)
+# Phase 3 — Persistence + Council
+from db import AmmoDB
+from social.council import AmmaCouncil
+from social.network import WeeklyReportCard
+# Phase 5 — Cross-device
+from phone_protocol import CrossDeviceState, detect_contradictions
 
 
 # ── Session ruling cache (grey zone memory) ───────────────────────────────────────
@@ -137,11 +150,25 @@ class AmmaSession:
         self._slump_fired = False
         self._alarm_fired = False
         self._stuck_check_ts: Optional[datetime] = None
+        self._meeting_mode_until: Optional[datetime] = None
         # Standalone modules
         self.content_reaction_state = ContentReactionState()
         self.smriti = SmritiStore()
         self.excuse_archive = ExcuseArchive()
         self._xp_earned_this_session = 0  # Track XP earned this session for receipt card
+        # Phase 1 — Reliability
+        self.logger = AmmaLogger()
+        self._session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self.notif_queue = NotificationQueue()
+        # Phase 2 — Calendar
+        self.calendar = CalendarIntegration()
+        self._calendar_events: list = []
+        self._deadline_urgency_fired: set = set()
+        # Phase 3 — Persistence + Council
+        self.db = AmmoDB()
+        # Phase 5 — Cross-device state (phone risk, updated via Cloud Brain)
+        self._phone_risk_level: int = 0
+        self._phone_category: str = "other"
 
     async def start(self):
         # Apply personality archetype (Ch 31)
@@ -168,6 +195,17 @@ class AmmaSession:
             config=self.config,
         )
         await self.voice.init_session()
+
+        # Phase 2: Calendar sync (graceful skip if not configured)
+        try:
+            self._calendar_events = await self.calendar.sync_today()
+            if self._calendar_events:
+                upcoming = self.calendar.get_upcoming(minutes=60)
+                if upcoming:
+                    titles = ", ".join(e.title for e in upcoming[:2])
+                    print(f"[Calendar] Upcoming in 60m: {titles}")
+        except Exception as _cal_err:
+            print(f"[Calendar] Skipped: {_cal_err}")
 
         if self.overlay is None:
             # Fallback: create overlay here (won't be in main thread — use only for testing)
@@ -205,6 +243,7 @@ class AmmaSession:
 
         # Start loops
         tasks = [
+            self._cloud_brain_client_loop(),  # Phase 5: optional cross-device
             vision_loop(self.vision_queue, interval=5.0,
                         monitor_index=self.config.monitor_index),
             self._classification_loop(),
@@ -213,8 +252,45 @@ class AmmaSession:
             self._time_of_day_loop(),
             self._wake_word_loop(),
             self._wake_word_handler_loop(),  # Drains queue: wake word → voice conversation
+            self._chat_poll_loop(),          # Polls UI chat input
         ]
         await asyncio.gather(*tasks)
+
+    async def _chat_poll_loop(self):
+        """Polls the overlay for typed chat messages and processes them."""
+        while self.running:
+            if self.overlay:
+                text = self.overlay.get_user_chat_nowait()
+                if text:
+                    print(f"[Chat] User typed: {text}")
+                    
+                    # If we're waiting for a grey zone clarification, treat this as the answer
+                    if self._grey_zone_app and self._grey_zone_ts:
+                        # Process user's excuse
+                        response = await self._generate_amma_response(f"I am on {self._grey_zone_app}. {text}")
+                        # For now, just trust them and map it to WORK (in a full implementation we'd let Gemini classify the excuse)
+                        self.ruling_cache.set(self._grey_zone_app, "WORK", source="chat-excuse")
+                        self._grey_zone_app = None
+                        self._grey_zone_ts = None
+                        
+                        vol = 0.0 if self._is_meeting_mode() else 0.68
+                        await self.voice.say(response, volume=vol)
+                        self.overlay.update(classification="WORK", last_line=response)
+                    else:
+                        # Normal chat interaction
+                        response = await self._generate_amma_response(text)
+                        vol = 0.0 if self._is_meeting_mode() else 0.68
+                        await self.voice.say(response, volume=vol)
+                        self.overlay.update(last_line=response)
+            await asyncio.sleep(0.2)
+
+    def _is_meeting_mode(self) -> bool:
+        if not self._meeting_mode_until:
+            return False
+        if datetime.now(timezone.utc) > self._meeting_mode_until:
+            self._meeting_mode_until = None
+            return False
+        return True
 
     async def _classification_loop(self):
         """Process frames from vision queue."""
@@ -259,7 +335,22 @@ class AmmaSession:
             dominant_app = frame.window_title
             is_nuclear = False
         else:
-            result: ClassificationResult = await self.classifier.classify(frame)
+            try:
+                result: ClassificationResult = await self.classifier.classify(frame)
+            except Exception as _classify_err:
+                print(f"[Fallback] Gemini classify failed ({_classify_err}) — using rule-based fallback")
+                fb = fallback_classify_window_title(frame.window_title)
+                result = ClassificationResult(
+                    classification=fb, confidence=0.5,
+                    dominant_app=frame.window_title, nuclear=False,
+                    reason="fallback",
+                )
+                self.logger.log_event(AmmaLogEvent(
+                    user_id=self.config.user_formal_name,
+                    session_id=self._session_id,
+                    event_type="FALLBACK_CLASSIFY",
+                    classification=fb,
+                ))
             classification = result.classification
             confidence = result.confidence
             dominant_app = result.dominant_app
@@ -267,12 +358,13 @@ class AmmaSession:
 
             # NUCLEAR detection — immediate intervention
             if is_nuclear:
-                classification = "TIMEPASS"
+                classification = "WASTE_OF_TIME"
                 intervention = self.state_machine.process_nuclear(config=self.config)
                 await self.voice.say(intervention["line"], volume=intervention["volume"])
                 self.overlay.update(
-                    classification="TIMEPASS",
+                    classification="WASTE_OF_TIME",
                     warning_level=6,
+                    next_warning_min=0,
                     last_line=intervention["line"],
                 )
                 self.achievements.lifetime_nuclear_count += 1
@@ -289,17 +381,27 @@ class AmmaSession:
                 await self._handle_grey_zone(result, frame, now)
                 return
 
-        # Check if grey zone timed out (30s passed, default to TIMEPASS)
+        # Check if grey zone timed out (30s passed, default to WASTE_OF_TIME)
         if (self._grey_zone_ts and self._grey_zone_app and
                 (now - self._grey_zone_ts) >= timedelta(seconds=30)):
             app = self._grey_zone_app
-            self.ruling_cache.set(app, "TIMEPASS", source="grey-timeout")
+            self.ruling_cache.set(app, "WASTE_OF_TIME", source="grey-timeout")
             self._grey_zone_ts = None
             self._grey_zone_app = None
 
         self.last_classification = classification
 
-        # ── Pattern tracking (Ch 18) ─────────────────────────────────────
+        # Phase 5: Cross-device contradiction check
+        await self._check_cross_device_contradiction(classification)
+
+        # Phase 1: Log classification event
+        self.logger.log_classification(
+            self.config.user_formal_name, self._session_id,
+            classification, confidence if not cached_ruling else 1.0,
+            latency_ms=0,
+        )
+
+        # ── Pattern tracking (Ch 18)
         interval = timedelta(seconds=5)  # frame interval
         if dominant_app:
             self.pattern_tracker.record(dominant_app, classification, interval)
@@ -312,7 +414,7 @@ class AmmaSession:
                 self.overlay.update(last_line=bh_line)
                 print(f"[Pattern] Black hole detected: {bh['app']}")
             # Amplified warning for known black holes (Ch 18.4)
-            if (classification == "TIMEPASS"
+            if (classification == "WASTE_OF_TIME"
                     and self.pattern_tracker.is_black_hole(dominant_app)):
                 min_level = self.pattern_tracker.get_starting_warning_level(dominant_app)
                 if self.state_machine.accumulator.warning_level < min_level:
@@ -360,7 +462,8 @@ class AmmaSession:
         self.overlay.update(
             classification=classification,
             warning_level=acc.warning_level,
-            timepass_min=acc.timepass_minutes,
+            waste_min=acc.waste_time_minutes,
+            next_warning_min=acc.minutes_to_next_warning,
             work_min=acc.work_minutes,
             in_break=acc.in_break,
         )
@@ -369,9 +472,17 @@ class AmmaSession:
         if intervention:
             line = intervention["line"]
             volume = intervention["volume"]
+            if self._is_meeting_mode():
+                volume = 0.0
             await self.voice.say(line, volume=volume)
             self.overlay.update(last_line=line)
             print(f"[State] {intervention['type']} → {self.state_machine.state}")
+            # Phase 1: Log intervention
+            self.logger.log_intervention(
+                self.config.user_formal_name, self._session_id,
+                acc.warning_level,
+                int(acc.waste_time_minutes * 60),
+            )
 
         # Content reactions (Ch 33) — educational/passive content detection
         if dominant_app and not self.support_manager.is_guard is False:
@@ -395,13 +506,21 @@ class AmmaSession:
 
     async def _handle_grey_zone(self, result: ClassificationResult,
                                 frame: ScreenFrame, now: datetime):
-        """Ask user to clarify grey zone content. Defaults to TIMEPASS after 30s.
+        """Ask user to clarify grey zone content. Defaults to WASTE_OF_TIME after 30s.
         If Serper is available, fetch web context to help future classification."""
         self._grey_zone_app = result.dominant_app
         self._grey_zone_ts = now
         question = get_line("GREY_QUESTION", app=result.dominant_app)
-        await self.voice.say(question, volume=0.65)
+        
+        # In Meeting Mode, don't speak, just ping the UI
+        vol = 0.0 if self._is_meeting_mode() else 0.65
+        await self.voice.say(question, volume=vol)
         self.overlay.update(classification="GREY", last_line=question)
+        
+        # Pop open the chat interface automatically for Grey Zone clarification
+        if self.overlay:
+            self.overlay.focus_chat()
+            
         # Async web context fetch for future classification (Ch 17.3)
         if self.serper.is_available:
             context = await self.serper.get_grey_zone_context(
@@ -476,6 +595,14 @@ class AmmaSession:
             line = "Welcome back. Let's go."
             await self.voice.say(line, volume=0.65)
             self.overlay.update(in_break=False, last_line=line)
+            # Phase 1: Release held notifications
+            held = self.notif_queue.release_held()
+            if held:
+                summary_parts = ", ".join(f"{n.app}: {n.title}" for n in held[:3])
+                more = f" and {len(held) - 3} more" if len(held) > 3 else ""
+                notif_line = f"{len(held)} notification{'s' if len(held) > 1 else ''} while you were away — {summary_parts}{more}."
+                await self.voice.say(notif_line, volume=0.55)
+                self.overlay.update(last_line=f"Notifications: {len(held)}")
 
         elif cmd == "demo nuclear":
             intervention = self.state_machine.process_nuclear()
@@ -488,11 +615,15 @@ class AmmaSession:
             await self._end_session()
 
         elif cmd == "demo reset":
-            acc.timepass_total = timedelta(0)
+            acc.waste_time_total = timedelta(0)
             acc.work_streak = timedelta(0)
             acc.warning_level = 0
             self.state_machine.state = "WORKING"
-            self.overlay.update(warning_level=0, timepass_min=0)
+            self.overlay.update(
+                warning_level=0,
+                waste_min=0,
+                next_warning_min=acc.minutes_to_next_warning,
+            )
             print("[Demo] Accumulators reset.")
 
         elif cmd.startswith("demo grey "):
@@ -535,13 +666,14 @@ class AmmaSession:
                     volume = get_volume(intervention_type)
                     await self.voice.say(line, volume=volume)
                     self.overlay.update(
-                        timepass_min=acc.timepass_minutes,
+                        waste_min=acc.waste_time_minutes,
+                        next_warning_min=acc.minutes_to_next_warning,
                         warning_level=acc.warning_level,
                         last_line=line,
                     )
                 print(
                     f"[Demo] Skipped {minutes}m → "
-                    f"Timepass: {acc.timepass_minutes}m, Level: {acc.warning_level}"
+                    f"Waste: {acc.waste_time_minutes}m, Level: {acc.warning_level}"
                 )
             except (IndexError, ValueError):
                 print("[Demo] Usage: demo <minutes> | demo nuclear | demo grey <app>")
@@ -554,6 +686,21 @@ class AmmaSession:
 
         elif cmd == "status":
             self._print_status()
+
+        elif cmd == "meeting":
+            if self._is_meeting_mode():
+                self._meeting_mode_until = None
+                line = "Meeting mode off. I will speak again."
+                await self.voice.say(line, volume=0.6)
+                self.overlay.update(last_line=line, mode="GUARD")
+                print("[Mode] Meeting mode disabled.")
+            else:
+                self._meeting_mode_until = datetime.now(timezone.utc) + timedelta(minutes=60)
+                line = "Meeting detected. I am watching, but I will stay quiet for an hour."
+                # Speak it once before silencing
+                await self.voice.say(line, volume=0.6)
+                self.overlay.update(last_line=line, mode="MEETING")
+                print("[Mode] Meeting mode enabled (60m).")
 
         elif cmd in ("quit", "exit", "q"):
             await self._end_session()
@@ -585,6 +732,27 @@ class AmmaSession:
             await self.voice.say(line, volume=0.65)
             self.overlay.update(last_line=line)
             print("[Mentor] Rubber duck protocol activated")
+
+        elif cmd.startswith("notify "):
+            # Syntax: notify <app> | <title>
+            parts = cmd[len("notify "):].split("|", 1)
+            app = parts[0].strip() if parts else "Unknown"
+            title = parts[1].strip() if len(parts) > 1 else "Notification"
+            notif = Notification(app=app, title=title, body="")
+            deliver_now = self.notif_queue.process(notif, self.state_machine.state)
+            if deliver_now:
+                notif_line = f"Notification from {app}: {title}"
+                await self.voice.say(notif_line, volume=0.55)
+                self.overlay.update(last_line=notif_line)
+            else:
+                print(f"[Notify] Held until break: {app} — {title}")
+
+        elif cmd == "council":
+            # Phase 3: Manual council verdict trigger
+            try:
+                await self._run_weekly_council()
+            except Exception as _ce:
+                print(f"[Council] Error: {_ce}")
 
         elif cmd == "xp":
             a = self.achievements
@@ -647,6 +815,9 @@ class AmmaSession:
                 # Emotional state check (Ch 96-97)
                 await self._check_emotional_state()
 
+                # Phase 2: Calendar deadline urgency
+                await self._check_deadline_urgency()
+
             except Exception as e:
                 print(f"[TimeOfDay] Error: {e}")
 
@@ -663,6 +834,8 @@ class AmmaSession:
             self.overlay.update(last_line=line)
             self.state_machine.state = "SUPPORT"
             print("[Emotional] CRISIS mode activated")
+            # Phase 1: Log crisis event
+            self.logger.log_crisis(self.config.user_formal_name, self._session_id, "CRISIS")
 
         elif distress in ("SUPPORT", "SUPPORT_DEEP") and self.support_manager.is_guard:
             self.support_manager.add_signal("signal_cluster")
@@ -725,6 +898,10 @@ class AmmaSession:
         """
         Drains _wake_word_queue and dispatches:
           - "__hotkey_break__" → toggle break
+          - "__hotkey_chat__"  → open chat UI
+          - "__hotkey_voice__" → trigger voice logic
+          - "__hotkey_meeting__" → toggle meeting mode
+          - "__hotkey_support__" → enter support mode
           - any wake word     → full voice conversation
         """
         while self.running:
@@ -738,6 +915,15 @@ class AmmaSession:
             if word == "__hotkey_break__":
                 cmd = "back" if self.break_manager.is_active else "break"
                 await self._handle_command(cmd)
+            elif word == "__hotkey_chat__":
+                if self.overlay:
+                    self.overlay.focus_chat()
+            elif word == "__hotkey_voice__":
+                await self._handle_voice_conversation("HOTKEY")
+            elif word == "__hotkey_meeting__":
+                await self._handle_command("meeting")
+            elif word == "__hotkey_support__":
+                await self._handle_command("support")
             else:
                 await self._handle_voice_conversation(word)
 
@@ -787,9 +973,15 @@ class AmmaSession:
             goals_ctx = f"Today's declared goals: {', '.join(self.config.goals)}. "
             if self.config.session_hours:
                 goals_ctx += f"Session target: {self.config.session_hours}h. "
+        # Phase 2: Calendar context
+        cal_ctx = ""
+        if self._calendar_events:
+            upcoming = self.calendar.get_upcoming(minutes=30)
+            if upcoming:
+                cal_ctx = f"Upcoming in 30m: {', '.join(e.title for e in upcoming[:2])}. "
         ctx = (
-            goals_ctx +
-            f"Work so far: {acc.work_minutes}m. Timepass: {acc.timepass_minutes}m. "
+            goals_ctx + cal_ctx +
+            f"Work so far: {acc.work_minutes}m. Waste-of-time: {acc.waste_time_minutes}m. "
             f"Warning level: {acc.warning_level}/6. "
             f"Mode: {self.support_manager.mode.value}. "
             f"In break: {self.break_manager.is_active}. "
@@ -824,18 +1016,22 @@ class AmmaSession:
     # ── Break Hotkey (Ch 35) ───────────────────────────────────────────
 
     def _register_hotkey(self):
-        """Register Ctrl+Shift+B as global break toggle (optional)."""
+        """Register Ctrl+Shift+Space/A/M/S/B as global hotkeys."""
         try:
             import keyboard
-            keyboard.add_hotkey(
-                "ctrl+shift+b",
-                lambda: asyncio.get_event_loop().call_soon_threadsafe(
-                    self._wake_word_queue.put_nowait, "__hotkey_break__"
-                ),
-            )
-            print("[Hotkey] Ctrl+Shift+B registered for break toggle")
+            loop = asyncio.get_event_loop()
+            
+            def dispatch(msg):
+                loop.call_soon_threadsafe(self._wake_word_queue.put_nowait, msg)
+                
+            keyboard.add_hotkey("ctrl+shift+b", lambda: dispatch("__hotkey_break__"))
+            keyboard.add_hotkey("ctrl+shift+space", lambda: dispatch("__hotkey_chat__"))
+            keyboard.add_hotkey("ctrl+shift+a", lambda: dispatch("__hotkey_voice__"))
+            keyboard.add_hotkey("ctrl+shift+m", lambda: dispatch("__hotkey_meeting__"))
+            keyboard.add_hotkey("ctrl+shift+s", lambda: dispatch("__hotkey_support__"))
+            print("[Hotkey] Registered Ctrl+Shift + B/Space/A/M/S")
         except ImportError:
-            print("[Hotkey] 'keyboard' package not installed — hotkey disabled.")
+            print("[Hotkey] 'keyboard' package not installed — hotkeys disabled.")
         except Exception as e:
             print(f"[Hotkey] Registration failed: {e}")
 
@@ -857,8 +1053,8 @@ class AmmaSession:
     async def _end_session(self):
         acc = self.state_machine.accumulator
         work_m = acc.work_minutes
-        timepass_m = acc.timepass_minutes
-        total = work_m + timepass_m or 1
+        waste_time_m = acc.waste_time_minutes
+        total = work_m + waste_time_m or 1
         efficiency = int((work_m / total) * 100)
         peak = acc.peak_warning_level
         best_streak = acc.longest_work_streak_minutes
@@ -873,7 +1069,7 @@ class AmmaSession:
             total_sessions=1,
             snapback_count=self.achievements.lifetime_snapback_count,
             nuclear_count=self.achievements.lifetime_nuclear_count,
-            timepass_total_minutes=timepass_m,
+            waste_time_total_minutes=waste_time_m,
             work_total_minutes=work_m,
             streak_days=self.achievements.streaks.daily_work,
         )
@@ -882,10 +1078,25 @@ class AmmaSession:
         trust_line = TRUST_DIALOGUE.get(trust_label, "")
         print(f"[Trust] Score: {trust_score:.3f} ({trust_label})")
 
+        # Phase 3: Persist session to local DB
+        try:
+            self.db.save_session(
+                date_str=datetime.now().strftime("%Y-%m-%d"),
+                work_min=work_m, timepass_min=waste_time_m,
+                efficiency=efficiency, peak_warning=peak,
+                nuclear_count=self.achievements.lifetime_nuclear_count,
+                trust_label=trust_label,
+                xp_earned=self._xp_earned_this_session,
+                goals=self.config.goals,
+            )
+            print("[DB] Session saved.")
+        except Exception as _db_err:
+            print(f"[DB] Save failed: {_db_err}")
+
         # Build summary
         summary = (
             f"Session complete. {session_h} hours {session_min} minutes total. "
-            f"Work: {work_m} minutes. Timepass: {timepass_m} minutes. "
+            f"Work: {work_m} minutes. Waste-of-time: {waste_time_m} minutes. "
             f"Efficiency: {efficiency} percent. "
         )
         if best_streak > 0:
@@ -909,6 +1120,16 @@ class AmmaSession:
         else:
             summary += "Today was not your best. We both know that. Tomorrow is a new session."
 
+        # Phase 3: Historical trend
+        try:
+            trend = self.db.get_weekly_trend()
+            if trend == "improving":
+                summary += " This week's trend is going up. Keep it going."
+            elif trend == "declining":
+                summary += " This week's trend is going the wrong way. We both know it."
+        except Exception:
+            pass
+
         if trust_line:
             summary += f" {trust_line}"
 
@@ -923,7 +1144,7 @@ class AmmaSession:
                 user_name=self.config.user_formal_name,
                 date=datetime.now().strftime("%Y-%m-%d"),
                 work_minutes=work_m,
-                timepass_minutes=timepass_m,
+                waste_time_minutes=waste_time_m,
                 efficiency=efficiency,
                 longest_streak_min=best_streak,
                 peak_warning=peak,
@@ -952,7 +1173,7 @@ class AmmaSession:
                 occurred_at=datetime.now(timezone.utc),
                 category="session",
                 content=(
-                    f"{work_m}m work, {timepass_m}m timepass, {efficiency}% efficiency, "
+                    f"{work_m}m work, {waste_time_m}m waste-of-time, {efficiency}% efficiency, "
                     f"peak warning L{peak}, trust={trust_label}"
                 ),
                 emotional_valence="positive" if efficiency >= 60 else "negative",
@@ -963,6 +1184,13 @@ class AmmaSession:
             print(f"[Smriti] Session memory recorded (sig={sig:.2f})")
         except Exception as e:
             print(f"[Smriti] Error: {e}")
+
+        # Phase 3: Weekly council verdict on Sundays
+        try:
+            if datetime.now().weekday() == 6:  # Sunday
+                await self._run_weekly_council()
+        except Exception as _ce:
+            print(f"[Council] Error: {_ce}")
 
         # Cleanup
         self.wake_word_listener.stop()
@@ -976,12 +1204,175 @@ class AmmaSession:
         print(
             f"\n[Status] State: {self.state_machine.state} | Mode: {mode} | "
             f"Window: {tw_name}\n"
-            f"         Work: {acc.work_minutes}m | Timepass: {acc.timepass_minutes}m | "
+            f"         Work: {acc.work_minutes}m | Waste: {acc.waste_time_minutes}m | "
             f"Level: {acc.warning_level} | Frames: {self.frame_count}\n"
             f"         XP: {a.current_xp} (L{a.current_level}) | "
             f"Streak: {a.streaks.daily_work}d | "
             f"Distress: {self.emotional_monitor.get_distress_level()}"
         )
+
+
+    # ── Phase 2: Deadline Urgency ─────────────────────────────────────
+
+    async def _check_deadline_urgency(self):
+        """Fire urgency line if a calendar deadline is within the danger zone."""
+        if not self._calendar_events:
+            return
+        now = datetime.now(timezone.utc)
+        for event in self._calendar_events:
+            if event.event_type not in ("DEADLINE", "PRESENTATION", "INTERVIEW"):
+                continue
+            urgency = calculate_deadline_urgency(event.start, now)
+            key = event.title[:40]
+            if urgency["level"] in ("CRITICAL", "HIGH") and key not in self._deadline_urgency_fired:
+                self._deadline_urgency_fired.add(key)
+                dl_line = urgency["dialogue"]
+                if dl_line:
+                    full_line = f"{dl_line} — {event.title}."
+                    await self.voice.say(full_line, volume=0.75)
+                    self.overlay.update(last_line=full_line)
+                    self.config.strictness = min(10, self.config.strictness + 1)
+                    print(f"[Calendar] Deadline urgency: {event.title} ({urgency['level']})")
+
+    # ── Phase 3: Weekly Council ────────────────────────────────────────
+
+    async def _run_weekly_council(self):
+        """Compute WeeklyReportCard, get Council verdict, announce it, optionally email parent."""
+        today = date.today()
+        week_start = today - timedelta(days=today.weekday())
+        inputs = self.db.compute_weekly_report_card_inputs(week_start)
+        if not inputs:
+            await self.voice.say("Not enough sessions this week to compute a verdict.", volume=0.65)
+            return
+        report = WeeklyReportCard(
+            user_id=self.config.user_formal_name,
+            week_start=datetime.now(timezone.utc),
+            focus_time_pct=inputs.get("focus_time_pct", 0.0),
+            consistency_score=inputs.get("consistency_score", 0.0),
+            nuclear_events=inputs.get("nuclear_events", 0),
+            late_night_3am_count=inputs.get("late_night_3am_count", 0),
+            reset_days=inputs.get("reset_days", 0),
+        )
+        score = report.raw_score
+        grade = report.grade
+        hall = report.hall_status
+        # Map cultural pack → council language
+        _pack_map = {"south-indian-kannada": "kannada", "south-indian-hindi": "hindi"}
+        pack = _pack_map.get(self.config.cultural_pack, "english")
+        council = AmmaCouncil()
+        verdict_text = council.generate_verdict(
+            percentile=90.0 if hall == "pride" else (5.0 if hall == "shame" else 50.0),
+            cultural_pack=pack,
+            score_data={"nuclear_events": inputs.get("nuclear_events", 0)},
+        )
+        self.db.save_weekly_score(
+            week_start=week_start.isoformat(),
+            score=score, grade=grade, hall_status=hall, verdict=verdict_text,
+        )
+        council_line = f"Weekly Council verdict: {verdict_text}"
+        await self.voice.say(council_line, volume=0.70)
+        self.overlay.update(last_line=f"Council: {grade} — {hall.upper()}")
+        print(f"[Council] Score: {score} ({grade}) | {hall.upper()}")
+        print(f"[Council] {verdict_text}")
+        # Phase 4: Parent notification
+        parent_email = os.environ.get("AMMA_PARENT_EMAIL", "")
+        if parent_email and hall in ("pride", "shame"):
+            from parent_portal import generate_shame_notification, generate_whatsapp_share
+            if hall == "shame":
+                body = generate_shame_notification(
+                    name=self.config.user_formal_name, score=score
+                )
+                subject = f"Amma Weekly Report — {self.config.user_formal_name} — {grade}"
+            else:
+                body = generate_whatsapp_share(
+                    name=self.config.user_formal_name, score=score,
+                    verdict="Hall of Pride", note=verdict_text[:100],
+                )
+                subject = f"Amma Weekly Report — {self.config.user_formal_name} had a great week!"
+            self._send_parent_notification(subject, body, parent_email)
+
+    # ── Phase 4: Parent Email ──────────────────────────────────────────
+
+    def _send_parent_notification(self, subject: str, body: str, parent_email: str):
+        """Send parent notification via SMTP. Configure SMTP_HOST/USER/PASS in .env."""
+        import smtplib
+        from email.mime.text import MIMEText
+        smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_user = os.environ.get("SMTP_USER", "")
+        smtp_pass = os.environ.get("SMTP_PASS", "")
+        if not smtp_user or not smtp_pass:
+            print("[ParentPortal] SMTP not configured (SMTP_USER/SMTP_PASS missing) — skipping")
+            return
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = smtp_user
+        msg["To"] = parent_email
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port) as srv:
+                srv.starttls()
+                srv.login(smtp_user, smtp_pass)
+                srv.send_message(msg)
+            print(f"[ParentPortal] Email sent → {parent_email}")
+        except Exception as _e:
+            print(f"[ParentPortal] Email failed: {_e}")
+
+    # ── Phase 5: Cross-device Contradiction ──────────────────────────
+
+    async def _check_cross_device_contradiction(self, laptop_classification: str):
+        """Detect laptop/phone contradictions and intervene."""
+        if self._phone_risk_level == 0:
+            return
+        state = CrossDeviceState(
+            laptop_classification=laptop_classification,
+            phone_risk_level=self._phone_risk_level,
+            phone_category=self._phone_category,
+        )
+        contradictions = detect_contradictions(state)
+        for c in contradictions[:1]:
+            await self.voice.say(c["message"], volume=0.78)
+            self.overlay.update(last_line=c["message"])
+            print(f"[CrossDevice] {c['type']}")
+            self._phone_risk_level = 0  # Reset to avoid repeated firing
+
+    async def _cloud_brain_client_loop(self):
+        """Optional: Connect to Cloud Brain WebSocket as laptop client.
+        Set CLOUD_BRAIN_URL=ws://localhost:8000 in .env to enable."""
+        cloud_brain_url = os.environ.get("CLOUD_BRAIN_URL", "")
+        if not cloud_brain_url:
+            return  # Not configured — skip silently
+        try:
+            import websockets  # type: ignore
+        except ImportError:
+            print("[CloudBrain] websockets not installed — cross-device disabled")
+            return
+        user_id = self.config.user_formal_name.lower().replace(" ", "_")
+        uri = f"{cloud_brain_url.rstrip('/')}/ws/{user_id}/laptop"
+        while self.running:
+            try:
+                async with websockets.connect(uri) as ws:
+                    print(f"[CloudBrain] Connected as {user_id}/laptop")
+                    async for raw_msg in ws:
+                        try:
+                            event = json.loads(raw_msg)
+                        except Exception:
+                            continue
+                        etype = event.get("type", "")
+                        data = event.get("data", {})
+                        if etype == "VOICE_COMMAND" and self.voice:
+                            text = data.get("text", "")
+                            volume = float(data.get("volume", 0.75))
+                            if text:
+                                await self.voice.say(text, volume=volume)
+                                self.overlay.update(last_line=text)
+                        elif etype == "STATE_UPDATE":
+                            # Update phone risk from Cloud Brain state
+                            self._phone_risk_level = int(data.get("phone_risk_level", 0))
+                            self._phone_category = data.get("phone_classification", "other")
+            except Exception as _cbe:
+                if self.running:
+                    print(f"[CloudBrain] Disconnected: {_cbe}. Retrying in 15s...")
+                    await asyncio.sleep(15)
 
 
 # ── Config persistence ──────────────────────────────────────────────────
@@ -1209,6 +1600,15 @@ def _normalize_archetype(raw: str) -> str:
             return key
     return "classic"  # Default
 
+def _normalize_string_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return []
+
 
 def apply_saved_config(config: AmmaConfig, saved: dict):
     """Apply saved user config dict onto AmmaConfig."""
@@ -1232,6 +1632,15 @@ def apply_saved_config(config: AmmaConfig, saved: dict):
         config.timezone = _normalize_timezone(saved["timezone"])
     if saved.get("keyword_path"):
         config.custom_keyword_paths = [saved["keyword_path"]]
+    # Privacy rules: allow both new and legacy keys
+    deny = _normalize_string_list(
+        saved.get("privacy_denylist", saved.get("privacy_exclusions"))
+    )
+    allow = _normalize_string_list(saved.get("privacy_allowlist"))
+    if deny:
+        config.privacy_denylist = deny
+    if allow or "privacy_allowlist" in saved:
+        config.privacy_allowlist = allow
 
 
 async def main(overlay: Optional[AmmaOverlay] = None):
@@ -1254,6 +1663,27 @@ async def main(overlay: Optional[AmmaOverlay] = None):
         # Returning user — restore saved profile
         apply_saved_config(config, saved)
         print(f"[Setup] Welcome back, {config.user_formal_name}. Profile loaded.")
+        # Phase 1: Fix timezone if it was missing from saved config
+        if not saved.get("timezone"):
+            print("  [Setup] Timezone missing from saved profile. Let's fix that.")
+            print("  Your timezone? (e.g. IST, EST, PST, UTC, or IANA like America/New_York)")
+            try:
+                _tz_raw = input("  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                _tz_raw = ""
+            config.timezone = _normalize_timezone(_tz_raw) if _tz_raw else "Asia/Kolkata"
+            saved["timezone"] = config.timezone
+            save_user_config(saved)
+            print(f"  [Setup] Timezone saved: {config.timezone}\n")
+    # Apply privacy policy before loops start.
+    set_privacy_rules(
+        denylist=config.privacy_denylist,
+        allowlist=config.privacy_allowlist,
+    )
+    print(
+        f"[Privacy] Denylist={len(config.privacy_denylist)} "
+        f"Allowlist={len(config.privacy_allowlist)}"
+    )
 
     # Daily goals — ask fresh each new day, confirm on re-launch
     session_state = ask_daily_goals(config)

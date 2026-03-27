@@ -24,8 +24,8 @@ redis>=5.0.0           # Session persistence (optional, in-memory fallback)
 python-multipart>=0.0.7
 
 # ─── Phase 4 — Integrations (optional, uncomment as needed) ────────
-# google-auth-oauthlib>=1.2.0   # Google Calendar OAuth
-# google-api-python-client>=2.0 # Google Calendar / Gmail API
+google-auth-oauthlib>=1.2.0   # Google Calendar OAuth
+google-api-python-client>=2.0 # Google Calendar / Gmail API
 # spotipy>=2.23.0               # Spotify music intelligence
 # supabase>=2.0.0               # Persistent storage (gamification, Smriti)
 
